@@ -78,6 +78,7 @@ saving a preset.
 
 ### Undo/Redo
 The undo/redo controls will undo or redo the following actions:
+
 - Adding/removing/replacing a processor
 - Creating/destroying a cables
 - Changing a parameter
@@ -145,6 +146,7 @@ suggestions first.
 If you run into any issues that require the global settings to
 be changed or reset, the global settings file can be found at
 the following location:
+
 - Windows: `C:\Users\<username>\AppData\Roaming\ChowdhuryDSP\BYOD\.plugin_settings.json`
 - Mac: `~/Library/ChowdhuryDSP/BYOD/.plugin_settings.json`
 - Linux: `~/.config/ChowdhuryDSP/BYOD/.plugin_settings.json`
@@ -163,6 +165,7 @@ override your chosen OpenGL setting, please visit the [global settings file](#re
 Information about specific sessions of the plugin can be seen in
 the plugin log files. These files are can be found in the following
 location:
+
 - Windows: `C:\Users\<username>\AppData\Roaming\ChowdhuryDSP\BYOD\Logs`
 - Mac: `~/Library/Logs/ChowdhuryDSP/BYOD/Logs`
 - Linux: `~/.config/ChowdhuryDSP/BYOD/Logs`
