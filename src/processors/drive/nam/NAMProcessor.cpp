@@ -39,9 +39,8 @@ NAMProcessor::NAMProcessor (UndoManager* um)
     };
     uiOptions.info.infoLink = "https://github.com/mikeoliphant/NeuralAudio";
 
-    // The Calibrate toggle is rendered inside the Model ComboBox popup (so we
-    // can grey it out when the loaded model doesn't carry calibration data).
-    // Hide it from the automatic knob layout to prevent a duplicate button.
+    // Calibrate toggle lives inside the model ComboBox popup; skip the
+    // automatic knob layout so we don't get a duplicate button.
     uiOptions.paramIDsToSkip.add (NAMTags::calibrateTag);
 }
 
@@ -56,12 +55,10 @@ ParamLayout NAMProcessor::createParameterLayout()
     createGainDBParameter (params, NAMTags::outputGainTag, "Output", -20.0f, 20.0f, 0.0f);
     createPercentParameter (params, NAMTags::qualityTag, "Quality", 1.0f);
 
-    // Input calibration: the user's audio-interface maximum input level in dBu
-    // (i.e. the analog level that would drive it to 0 dBFS). NAM's convention
-    // uses this with the model's captured input_level_dbu to gain-match the
-    // digital signal so the model "sees" the same voltage the real amp did.
-    // Typical values: Focusrite Scarlett ~9 dBu, RME Babyface ~13 dBu,
-    // pro interfaces up to 24-26 dBu.
+    // Input calibration: user's audio-interface max input level in dBu (the
+    // analog level that drives it to 0 dBFS). Combined with the model's
+    // captured input_level_dbu to gain-match the digital signal to the
+    // voltage the real amp saw during capture.
     static const auto dBuValToString = [] (float v)
     { return juce::String (v, 1) + " dBu"; };
     static const auto stringTodBuVal = [] (const juce::String& s)
@@ -78,6 +75,42 @@ ParamLayout NAMProcessor::createParameterLayout()
     emplace_param<chowdsp::BoolParameter> (params, NAMTags::calibrateTag, "Calibrate", true);
 
     return { params.begin(), params.end() };
+}
+
+NAMProcessor::ModelLoadResult NAMProcessor::buildModelsForPath (const String& path)
+{
+    ModelLoadResult result;
+    const auto pathStd = path.toStdString();
+
+    for (size_t ch = 0; ch < result.models.size(); ++ch)
+    {
+        NeuralAudio::NeuralModelLoader loader;
+        loader.SetExternalSampleRate ((int) processSampleRate);
+        loader.SetDefaultMaxAudioBufferSize (processMaxBlockSize);
+        // Use 0 dBu as baseline so we can back-solve modelInputLevelDBu from
+        // GetRecommendedInputDBAdjustment() (== 0 - modelInputLevelDBu).
+        loader.SetAudioInputLevelDBu (0.0f);
+
+        auto* raw = loader.CreateFromFile (pathStd);
+        if (raw == nullptr)
+            throw std::runtime_error ("CreateFromFile returned null (unsupported "
+                                      "architecture or malformed file)");
+
+        result.models[ch].reset (raw);
+        result.models[ch]->SetMaxAudioBufferSize (processMaxBlockSize);
+        result.models[ch]->SetQualityScaleFactor (qualityParam != nullptr
+                                                      ? qualityParam->getCurrentValue()
+                                                      : 1.0f);
+
+        if (ch == 0)
+        {
+            result.hasCalibration = ! result.models[ch]->GetMetadata ("input_level_dbu").empty();
+            result.modelInputLevelDBu = -result.models[ch]->GetRecommendedInputDBAdjustment();
+            result.calOutputAdjustDB = result.models[ch]->GetRecommendedOutputDBAdjustment();
+        }
+    }
+
+    return result;
 }
 
 void NAMProcessor::clearModel()
@@ -99,9 +132,8 @@ static void reportNAMError (const String& title, const String& message, Componen
 {
     Logger::writeToLog ("[NAM] " + title + ": " + message);
 
-    // Preferred: BYOD's in-plugin ErrorMessageView (requires a live BYODPluginEditor
-    // in the parent chain). If parent is null/detached, fall back to JUCE's async
-    // native dialog so the user sees SOMETHING.
+    // Prefer BYOD's in-plugin ErrorMessageView; fall back to a native async
+    // dialog if the parent is detached.
     if (parent != nullptr)
     {
         ErrorMessageView::showErrorMessage (title, message, "OK", parent);
@@ -119,78 +151,20 @@ static void reportNAMError (const String& title, const String& message, Componen
 
 void NAMProcessor::loadModelFromFile (const File& file, Component* parent)
 {
-    Logger::writeToLog ("[NAM] loadModelFromFile: " + file.getFullPathName());
-
     if (file == File {} || ! file.existsAsFile())
     {
         reportNAMError ("NAM Error", "Selected model file does not exist:\n" + file.getFullPathName(), parent);
         return;
     }
 
-    // Build both channel models first; only swap in if BOTH succeed. Prevents
-    // a broken half-loaded state on partial failure.
-    std::array<std::unique_ptr<NeuralAudio::NeuralModel>, 2> newModels {};
-
-    // Calibration values probed from the newly-loaded model. Only committed
-    // to the processor's cached state on full success.
-    bool newHasCalibration = false;
-    float newModelInputLevelDBu = 12.0f;
-    float newCalOutputAdjustDB = 0.0f;
-
+    // Two-phase commit: build the full result first, only swap in on success.
+    ModelLoadResult loaded;
     try
     {
-        const auto path = file.getFullPathName().toStdString();
-        for (size_t ch = 0; ch < newModels.size(); ++ch)
-        {
-            Logger::writeToLog ("[NAM] loading channel " + String ((int) ch) + " at "
-                                + String (processSampleRate, 1) + " Hz, block "
-                                + String (processMaxBlockSize));
-
-            NeuralAudio::NeuralModelLoader loader;
-            loader.SetExternalSampleRate ((int) processSampleRate);
-            loader.SetDefaultMaxAudioBufferSize (processMaxBlockSize);
-            // Use 0 dBu as baseline so we can back-solve modelInputLevelDBu
-            // from GetRecommendedInputDBAdjustment() (== 0 - modelInputLevelDBu).
-            loader.SetAudioInputLevelDBu (0.0f);
-
-            auto* raw = loader.CreateFromFile (path);
-            if (raw == nullptr)
-                throw std::runtime_error ("CreateFromFile returned null (unsupported "
-                                          "architecture or malformed file)");
-
-            newModels[ch].reset (raw);
-            newModels[ch]->SetMaxAudioBufferSize (processMaxBlockSize);
-            newModels[ch]->SetQualityScaleFactor (qualityParam != nullptr
-                                                      ? qualityParam->getCurrentValue()
-                                                      : 1.0f);
-
-            // Probe calibration once (from channel 0). Both channels load the
-            // same file, so the values are identical.
-            if (ch == 0)
-            {
-                // GetMetadata returns "" if the key isn't present. NAM v0.5.5+
-                // and calibrated Keras models set "input_level_dbu".
-                const auto inputLevelStr = newModels[ch]->GetMetadata ("input_level_dbu");
-                newHasCalibration = ! inputLevelStr.empty();
-
-                // modelInputLevelDBu = -GetRecommendedInputDBAdjustment() given
-                // audioInputLevelDBu was set to 0 on the loader.
-                newModelInputLevelDBu = -newModels[ch]->GetRecommendedInputDBAdjustment();
-
-                // Output adjustment (== -18 - modelLoudnessDB) is independent
-                // of the user's input calibration setting.
-                newCalOutputAdjustDB = newModels[ch]->GetRecommendedOutputDBAdjustment();
-
-                Logger::writeToLog (String ("[NAM] calibration: hasCal=")
-                                    + (newHasCalibration ? "yes" : "no")
-                                    + ", modelInDBu=" + String (newModelInputLevelDBu, 2)
-                                    + ", recommendedOutDB=" + String (newCalOutputAdjustDB, 2));
-            }
-        }
+        loaded = buildModelsForPath (file.getFullPathName());
     }
     catch (const std::exception& exc)
     {
-        // newModels is discarded on scope exit -> no partial state committed.
         reportNAMError ("NAM Error",
                         String { "Unable to load NAM model:\n\n" } + exc.what()
                             + "\n\nFile: " + file.getFullPathName(),
@@ -205,42 +179,41 @@ void NAMProcessor::loadModelFromFile (const File& file, Component* parent)
         return;
     }
 
-    Logger::writeToLog ("[NAM] load succeeded, swapping in models: "
-                        + file.getFileNameWithoutExtension());
-
     {
         SpinLock::ScopedLockType lock { modelChangingMutex };
         for (size_t ch = 0; ch < models.size(); ++ch)
-            models[ch] = std::move (newModels[ch]);
+            models[ch] = std::move (loaded.models[ch]);
         cachedModelPath = file.getFullPathName();
         currentModelName = file.getFileNameWithoutExtension();
-        modelHasCalibration = newHasCalibration;
-        modelInputLevelDBu = newModelInputLevelDBu;
-        calOutputAdjustDB = newCalOutputAdjustDB;
+        modelHasCalibration = loaded.hasCalibration;
+        modelInputLevelDBu = loaded.modelInputLevelDBu;
+        calOutputAdjustDB = loaded.calOutputAdjustDB;
+        lastQualityApplied = qualityParam != nullptr ? qualityParam->getCurrentValue() : 1.0f;
     }
 
     modelChangeBroadcaster();
-    Logger::writeToLog ("[NAM] broadcaster fired, UI should now show: " + currentModelName);
 }
 
 void NAMProcessor::chooseModel (Component* parent)
 {
+    // Start the chooser in the directory of the currently loaded model so
+    // switching between variants in the same folder is a single click.
+    const File startLocation = cachedModelPath.isNotEmpty()
+                                   ? File { cachedModelPath }.getParentDirectory()
+                                   : File {};
+
     modelChooser = std::make_shared<FileChooser> ("Load NAM Model",
-                                                  File {},
+                                                  startLocation,
                                                   "*.nam;*.json",
                                                   true,
                                                   false,
                                                   parent);
-
-    Logger::writeToLog ("[NAM] launching file chooser");
 
     modelChooser->launchAsync (
         FileBrowserComponent::FileChooserFlags::canSelectFiles,
         [this, safeParent = Component::SafePointer { parent }] (const FileChooser& fc)
         {
             const auto file = fc.getResult();
-            Logger::writeToLog ("[NAM] file chooser result: "
-                                + (file == File {} ? String { "(cancelled)" } : file.getFullPathName()));
             if (file == File {})
                 return;
             loadModelFromFile (file, safeParent.getComponent());
@@ -268,51 +241,24 @@ void NAMProcessor::prepare (double sampleRate, int samplesPerBlock)
 
     // Reload the current model at the new sample rate / buffer size. WaveNet
     // models bake the sample rate in at load time, so we must recreate.
+    // On failure we keep the previous models running rather than dropping to
+    // bypass — a stale model is preferable to silent inconsistent state.
     if (cachedModelPath.isNotEmpty())
     {
-        const auto pathCopy = cachedModelPath;
         try
         {
-            std::array<std::unique_ptr<NeuralAudio::NeuralModel>, 2> newModels {};
-            bool newHasCalibration = false;
-            float newModelInputLevelDBu = 12.0f;
-            float newCalOutputAdjustDB = 0.0f;
-
-            for (size_t ch = 0; ch < newModels.size(); ++ch)
-            {
-                NeuralAudio::NeuralModelLoader loader;
-                loader.SetExternalSampleRate ((int) processSampleRate);
-                loader.SetDefaultMaxAudioBufferSize (processMaxBlockSize);
-                loader.SetAudioInputLevelDBu (0.0f);
-                auto* raw = loader.CreateFromFile (pathCopy.toStdString());
-                if (raw == nullptr)
-                    throw std::runtime_error ("CreateFromFile returned null");
-                newModels[ch].reset (raw);
-                newModels[ch]->SetMaxAudioBufferSize (processMaxBlockSize);
-                newModels[ch]->SetQualityScaleFactor (qualityParam != nullptr
-                                                          ? qualityParam->getCurrentValue()
-                                                          : 1.0f);
-
-                if (ch == 0)
-                {
-                    newHasCalibration = ! newModels[ch]->GetMetadata ("input_level_dbu").empty();
-                    newModelInputLevelDBu = -newModels[ch]->GetRecommendedInputDBAdjustment();
-                    newCalOutputAdjustDB = newModels[ch]->GetRecommendedOutputDBAdjustment();
-                }
-            }
+            auto loaded = buildModelsForPath (cachedModelPath);
             SpinLock::ScopedLockType lock { modelChangingMutex };
             for (size_t ch = 0; ch < models.size(); ++ch)
-                models[ch] = std::move (newModels[ch]);
-            modelHasCalibration = newHasCalibration;
-            modelInputLevelDBu = newModelInputLevelDBu;
-            calOutputAdjustDB = newCalOutputAdjustDB;
+                models[ch] = std::move (loaded.models[ch]);
+            modelHasCalibration = loaded.hasCalibration;
+            modelInputLevelDBu = loaded.modelInputLevelDBu;
+            calOutputAdjustDB = loaded.calOutputAdjustDB;
+            lastQualityApplied = qualityParam != nullptr ? qualityParam->getCurrentValue() : 1.0f;
         }
         catch (...)
         {
-            SpinLock::ScopedLockType lock { modelChangingMutex };
-            for (auto& m : models)
-                m.reset();
-            modelHasCalibration = false;
+            Logger::writeToLog ("NAM: prepare() model reload failed for " + cachedModelPath);
         }
     }
 }
@@ -326,35 +272,48 @@ void NAMProcessor::processAudio (AudioBuffer<float>& buffer)
     const auto numChannels = buffer.getNumChannels();
     const auto numSamples = buffer.getNumSamples();
 
-    // Calibration only kicks in if the toggle is on AND the model carries
-    // input_level_dbu metadata. Otherwise the two cal stages are unity.
+    // Calibration only engages when the toggle is on AND the model carries
+    // input_level_dbu metadata. Otherwise the cal stages run at unity.
     const bool applyCalibration = modelHasCalibration && calibrateParam->get();
     const float calInDB = applyCalibration
                               ? (inputCalDBuParam->getCurrentValue() - modelInputLevelDBu)
                               : 0.0f;
     const float calOutDB = applyCalibration ? calOutputAdjustDB : 0.0f;
 
-    // Signal chain: user-in → cal-in → model → cal-out → user-out → DC block
+    // Signal chain: user-in -> cal-in -> model -> cal-out -> user-out -> DC block
     inGain.setGainDecibels (inputGainParam->getCurrentValue());
     inGain.process (buffer);
 
     calInGain.setGainDecibels (calInDB);
     calInGain.process (buffer);
 
-    // Model processing (per channel)
+    // Only push the quality parameter into the model when it has actually
+    // changed AND the model reports the change is realtime-safe. Otherwise
+    // the new value takes effect at the next model reload.
+    const float newQuality = qualityParam->getCurrentValue();
+    const bool qualityChanged = newQuality != lastQualityApplied;
+    bool qualityAppliedThisBlock = true;
+
     for (int ch = 0; ch < numChannels && ch < (int) models.size(); ++ch)
     {
-        if (models[(size_t) ch] == nullptr)
+        auto& model = models[(size_t) ch];
+        if (model == nullptr)
             continue;
 
-        // Keep the quality parameter in sync. NeuralAudio guarantees this is
-        // realtime-safe when IsQualityChangeRealtimeSafe() returns true (the
-        // default for supported architectures).
-        models[(size_t) ch]->SetQualityScaleFactor (qualityParam->getCurrentValue());
+        if (qualityChanged)
+        {
+            if (model->IsQualityChangeRealtimeSafe (newQuality))
+                model->SetQualityScaleFactor (newQuality);
+            else
+                qualityAppliedThisBlock = false;
+        }
 
         auto* x = buffer.getWritePointer (ch);
-        models[(size_t) ch]->Process (x, x, (size_t) numSamples);
+        model->Process (x, x, (size_t) numSamples);
     }
+
+    if (qualityChanged && qualityAppliedThisBlock)
+        lastQualityApplied = newQuality;
 
     calOutGain.setGainDecibels (calOutDB);
     calOutGain.process (buffer);
@@ -362,7 +321,6 @@ void NAMProcessor::processAudio (AudioBuffer<float>& buffer)
     outGain.setGainDecibels (outputGainParam->getCurrentValue());
     outGain.process (buffer);
 
-    // DC blocker
     dcBlocker.processBlock (buffer);
 }
 
@@ -378,36 +336,56 @@ void NAMProcessor::fromXML (XmlElement* xml, const chowdsp::Version& version, bo
     BaseProcessor::fromXML (xml, version, loadPosition);
 
     const auto savedPath = xml->getStringAttribute (NAMTags::modelPathTag, {});
-    if (savedPath.isNotEmpty())
+    if (savedPath.isEmpty())
+        return;
+
+    const File file { savedPath };
+    bool loadFailed = ! file.existsAsFile();
+
+    if (! loadFailed)
     {
-        const File file { savedPath };
-        if (file.existsAsFile())
+        try
         {
-            loadModelFromFile (file);
-        }
-        else
-        {
-            Logger::writeToLog ("NAM: saved model path no longer exists: " + savedPath);
+            auto loaded = buildModelsForPath (savedPath);
             SpinLock::ScopedLockType lock { modelChangingMutex };
-            for (auto& m : models)
-                m.reset();
-            cachedModelPath = savedPath; // remember what was saved so save-round-trips are stable
-            currentModelName = "(missing) " + File (savedPath).getFileNameWithoutExtension();
-            modelChangeBroadcaster();
+            for (size_t ch = 0; ch < models.size(); ++ch)
+                models[ch] = std::move (loaded.models[ch]);
+            cachedModelPath = savedPath;
+            currentModelName = file.getFileNameWithoutExtension();
+            modelHasCalibration = loaded.hasCalibration;
+            modelInputLevelDBu = loaded.modelInputLevelDBu;
+            calOutputAdjustDB = loaded.calOutputAdjustDB;
+            lastQualityApplied = qualityParam != nullptr ? qualityParam->getCurrentValue() : 1.0f;
+        }
+        catch (...)
+        {
+            loadFailed = true;
         }
     }
+
+    if (loadFailed)
+    {
+        // Session references a model we can't load right now. Log-only and
+        // preserve the saved path so save-round-trips are stable.
+        Logger::writeToLog ("NAM: could not load saved model: " + savedPath);
+        SpinLock::ScopedLockType lock { modelChangingMutex };
+        for (auto& m : models)
+            m.reset();
+        cachedModelPath = savedPath;
+        currentModelName = "(missing) " + File (savedPath).getFileNameWithoutExtension();
+        modelHasCalibration = false;
+    }
+
+    modelChangeBroadcaster();
 }
 
 bool NAMProcessor::getCustomComponents (OwnedArray<Component>& customComps, chowdsp::HostContextProvider& hcp)
 {
     using namespace chowdsp::ParamUtils;
 
-    // NOTE: BYOD's KnobsComponent only lays out custom components that are
-    // Sliders or ComboBoxes (TextButtons in the customComponents array get
-    // zero bounds). So we use a ComboBox here, mirroring GuitarMLAmp's
-    // ModelChoiceBox pattern. The popup is built manually (bypassing
-    // ComboBox's automatic menu) so we can include a checkable, optionally-
-    // disabled "Calibrate Input" toggle.
+    // BYOD's KnobsComponent only lays out Sliders/ComboBoxes as custom
+    // components, so we use a ComboBox and override showPopup() to inject a
+    // dynamically-disabled "Calibrate Input" toggle. Mirrors GuitarMLAmp.
     class ModelChoiceBox : public ComboBox
     {
     public:
@@ -419,8 +397,6 @@ bool NAMProcessor::getCustomComponents (OwnedArray<Component>& customComps, chow
 
             modelChangeCallback = caster.connect ([this]
                                                   {
-                                                      Logger::writeToLog ("[NAM] UI: model-change broadcast received, refreshing ComboBox to: "
-                                                                          + getDisplayText());
                                                       setText (getDisplayText(), dontSendNotification);
                                                       refreshTooltip();
                                                       repaint();
@@ -429,8 +405,6 @@ bool NAMProcessor::getCustomComponents (OwnedArray<Component>& customComps, chow
             Component::setName ("nam_model__box");
         }
 
-        // Override the default ComboBox popup so we can inject a checkable
-        // Calibrate item that can be dynamically disabled.
         void showPopup() override
         {
             juce::PopupMenu menu;
@@ -464,11 +438,19 @@ bool NAMProcessor::getCustomComponents (OwnedArray<Component>& customComps, chow
             menu.addItem (calItem);
 
             menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this),
-                                [this] (int result)
+                                [safeThis = Component::SafePointer<ModelChoiceBox> { this }] (int result)
                                 {
+                                    // Reset the ComboBox's internal menuActive flag; the default
+                                    // showPopup does this via its finished-callback, but we
+                                    // bypassed it by driving the menu ourselves.
+                                    if (safeThis == nullptr)
+                                        return;
+                                    safeThis->hidePopup();
+
+                                    auto& processor = safeThis->processor;
                                     if (result == loadItemId)
                                     {
-                                        processor.chooseModel (getTopLevelComponent());
+                                        processor.chooseModel (safeThis->getTopLevelComponent());
                                     }
                                     else if (result == clearItemId)
                                     {
@@ -482,7 +464,7 @@ bool NAMProcessor::getCustomComponents (OwnedArray<Component>& customComps, chow
                                             p->beginChangeGesture();
                                             p->setValueNotifyingHost (newValue ? 1.0f : 0.0f);
                                             p->endChangeGesture();
-                                            refreshTooltip();
+                                            safeThis->refreshTooltip();
                                         }
                                     }
                                 });

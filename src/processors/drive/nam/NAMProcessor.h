@@ -53,6 +53,20 @@ public:
     chowdsp::BoolParameter* getCalibrateParam() const { return calibrateParam; }
 
 private:
+    struct ModelLoadResult
+    {
+        std::array<std::unique_ptr<NeuralAudio::NeuralModel>, 2> models {};
+        bool hasCalibration = false;
+        float modelInputLevelDBu = 12.0f;
+        float calOutputAdjustDB = 0.0f;
+    };
+
+    /** Builds both channel models for @p path at the current sample rate /
+     *  block size and probes calibration metadata. Throws std::runtime_error
+     *  on any failure; on success the returned result is fully populated.
+     */
+    ModelLoadResult buildModelsForPath (const String& path);
+
     // Broadcaster used to notify the UI when the loaded model changes.
     using ModelChangeBroadcaster = chowdsp::Broadcaster<void()>;
     ModelChangeBroadcaster modelChangeBroadcaster;
@@ -69,8 +83,9 @@ private:
     String cachedModelPath; // absolute path, empty if no model loaded
     String currentModelName;
 
-    // Calibration info cached at model load time. All values are only
-    // meaningful when modelHasCalibration is true.
+    // Calibration info cached at model load time. modelHasCalibration gates
+    // whether the values are applied in processAudio; the numeric fields are
+    // always populated (defaults are used when the model lacks metadata).
     bool modelHasCalibration = false;
     float modelInputLevelDBu = 12.0f;   // dBu the amp was captured at
     float calOutputAdjustDB = 0.0f;     // -18 - modelLoudnessDB
@@ -83,6 +98,7 @@ private:
 
     double processSampleRate = 48000.0;
     int processMaxBlockSize = 512;
+    float lastQualityApplied = 1.0f;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (NAMProcessor)
 };

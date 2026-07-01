@@ -138,7 +138,6 @@ if(NOT IOS)
     # shared library link, as required for it to actually take effect.
     target_link_libraries(juce_plugin_modules PRIVATE
         "$<LINK_LIBRARY:WHOLE_ARCHIVE,NeuralAudio>")
-    target_compile_definitions(juce_plugin_modules PUBLIC BYOD_HAS_NEURAL_AUDIO=1)
 endif()
 
 target_compile_definitions(juce_plugin_modules
