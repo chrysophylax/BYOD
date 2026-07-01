@@ -43,6 +43,15 @@ public:
 
     const String& getCurrentModelName() const { return currentModelName; }
 
+    /** True if the currently loaded model exposes input_level_dbu metadata. */
+    bool currentModelHasCalibration() const { return modelHasCalibration; }
+
+    /** The dBu level the model was captured at (only valid if calibrated). */
+    float getModelInputLevelDBu() const { return modelInputLevelDBu; }
+
+    /** Access to the Calibrate toggle parameter (for the UI popup). */
+    chowdsp::BoolParameter* getCalibrateParam() const { return calibrateParam; }
+
 private:
     // Broadcaster used to notify the UI when the loaded model changes.
     using ModelChangeBroadcaster = chowdsp::Broadcaster<void()>;
@@ -51,6 +60,8 @@ private:
     chowdsp::FloatParameter* inputGainParam = nullptr;
     chowdsp::FloatParameter* outputGainParam = nullptr;
     chowdsp::FloatParameter* qualityParam = nullptr;
+    chowdsp::FloatParameter* inputCalDBuParam = nullptr;
+    chowdsp::BoolParameter* calibrateParam = nullptr;
 
     std::array<std::unique_ptr<NeuralAudio::NeuralModel>, 2> models {};
     SpinLock modelChangingMutex;
@@ -58,9 +69,16 @@ private:
     String cachedModelPath; // absolute path, empty if no model loaded
     String currentModelName;
 
+    // Calibration info cached at model load time. All values are only
+    // meaningful when modelHasCalibration is true.
+    bool modelHasCalibration = false;
+    float modelInputLevelDBu = 12.0f;   // dBu the amp was captured at
+    float calOutputAdjustDB = 0.0f;     // -18 - modelLoudnessDB
+
     std::shared_ptr<FileChooser> modelChooser;
 
     chowdsp::Gain<float> inGain, outGain;
+    chowdsp::Gain<float> calInGain, calOutGain; // calibration-only stages
     chowdsp::FirstOrderHPF<float> dcBlocker;
 
     double processSampleRate = 48000.0;

@@ -13,6 +13,8 @@ namespace NAMTags
 const String inputGainTag = "nam_input";
 const String outputGainTag = "nam_output";
 const String qualityTag = "nam_quality";
+const String inputCalTag = "nam_input_cal";
+const String calibrateTag = "nam_calibrate";
 const String modelPathTag = "nam_model_path";
 } // namespace NAMTags
 
@@ -23,6 +25,8 @@ NAMProcessor::NAMProcessor (UndoManager* um)
     loadParameterPointer (inputGainParam, vts, NAMTags::inputGainTag);
     loadParameterPointer (outputGainParam, vts, NAMTags::outputGainTag);
     loadParameterPointer (qualityParam, vts, NAMTags::qualityTag);
+    loadParameterPointer (inputCalDBuParam, vts, NAMTags::inputCalTag);
+    loadParameterPointer (calibrateParam, vts, NAMTags::calibrateTag);
 
     uiOptions.backgroundColour = Colour (0xFF2E2E38);
     uiOptions.powerColour = Colour (0xFF19E5C6);
@@ -34,6 +38,11 @@ NAMProcessor::NAMProcessor (UndoManager* um)
         "Mike Oliphant (NeuralAudio)",
     };
     uiOptions.info.infoLink = "https://github.com/mikeoliphant/NeuralAudio";
+
+    // The Calibrate toggle is rendered inside the Model ComboBox popup (so we
+    // can grey it out when the loaded model doesn't carry calibration data).
+    // Hide it from the automatic knob layout to prevent a duplicate button.
+    uiOptions.paramIDsToSkip.add (NAMTags::calibrateTag);
 }
 
 NAMProcessor::~NAMProcessor() = default;
@@ -47,16 +56,42 @@ ParamLayout NAMProcessor::createParameterLayout()
     createGainDBParameter (params, NAMTags::outputGainTag, "Output", -20.0f, 20.0f, 0.0f);
     createPercentParameter (params, NAMTags::qualityTag, "Quality", 1.0f);
 
+    // Input calibration: the user's audio-interface maximum input level in dBu
+    // (i.e. the analog level that would drive it to 0 dBFS). NAM's convention
+    // uses this with the model's captured input_level_dbu to gain-match the
+    // digital signal so the model "sees" the same voltage the real amp did.
+    // Typical values: Focusrite Scarlett ~9 dBu, RME Babyface ~13 dBu,
+    // pro interfaces up to 24-26 dBu.
+    static const auto dBuValToString = [] (float v)
+    { return juce::String (v, 1) + " dBu"; };
+    static const auto stringTodBuVal = [] (const juce::String& s)
+    { return s.getFloatValue(); };
+    emplace_param<chowdsp::FloatParameter> (
+        params,
+        NAMTags::inputCalTag,
+        "Input Cal",
+        juce::NormalisableRange<float> { 0.0f, 30.0f },
+        12.0f,
+        std::function<juce::String (float)> { dBuValToString },
+        std::function<float (const juce::String&)> { stringTodBuVal });
+
+    emplace_param<chowdsp::BoolParameter> (params, NAMTags::calibrateTag, "Calibrate", true);
+
     return { params.begin(), params.end() };
 }
 
 void NAMProcessor::clearModel()
 {
-    SpinLock::ScopedLockType lock { modelChangingMutex };
-    for (auto& m : models)
-        m.reset();
-    cachedModelPath.clear();
-    currentModelName.clear();
+    {
+        SpinLock::ScopedLockType lock { modelChangingMutex };
+        for (auto& m : models)
+            m.reset();
+        cachedModelPath.clear();
+        currentModelName.clear();
+        modelHasCalibration = false;
+        modelInputLevelDBu = 12.0f;
+        calOutputAdjustDB = 0.0f;
+    }
     modelChangeBroadcaster();
 }
 
@@ -96,6 +131,12 @@ void NAMProcessor::loadModelFromFile (const File& file, Component* parent)
     // a broken half-loaded state on partial failure.
     std::array<std::unique_ptr<NeuralAudio::NeuralModel>, 2> newModels {};
 
+    // Calibration values probed from the newly-loaded model. Only committed
+    // to the processor's cached state on full success.
+    bool newHasCalibration = false;
+    float newModelInputLevelDBu = 12.0f;
+    float newCalOutputAdjustDB = 0.0f;
+
     try
     {
         const auto path = file.getFullPathName().toStdString();
@@ -108,6 +149,9 @@ void NAMProcessor::loadModelFromFile (const File& file, Component* parent)
             NeuralAudio::NeuralModelLoader loader;
             loader.SetExternalSampleRate ((int) processSampleRate);
             loader.SetDefaultMaxAudioBufferSize (processMaxBlockSize);
+            // Use 0 dBu as baseline so we can back-solve modelInputLevelDBu
+            // from GetRecommendedInputDBAdjustment() (== 0 - modelInputLevelDBu).
+            loader.SetAudioInputLevelDBu (0.0f);
 
             auto* raw = loader.CreateFromFile (path);
             if (raw == nullptr)
@@ -119,6 +163,29 @@ void NAMProcessor::loadModelFromFile (const File& file, Component* parent)
             newModels[ch]->SetQualityScaleFactor (qualityParam != nullptr
                                                       ? qualityParam->getCurrentValue()
                                                       : 1.0f);
+
+            // Probe calibration once (from channel 0). Both channels load the
+            // same file, so the values are identical.
+            if (ch == 0)
+            {
+                // GetMetadata returns "" if the key isn't present. NAM v0.5.5+
+                // and calibrated Keras models set "input_level_dbu".
+                const auto inputLevelStr = newModels[ch]->GetMetadata ("input_level_dbu");
+                newHasCalibration = ! inputLevelStr.empty();
+
+                // modelInputLevelDBu = -GetRecommendedInputDBAdjustment() given
+                // audioInputLevelDBu was set to 0 on the loader.
+                newModelInputLevelDBu = -newModels[ch]->GetRecommendedInputDBAdjustment();
+
+                // Output adjustment (== -18 - modelLoudnessDB) is independent
+                // of the user's input calibration setting.
+                newCalOutputAdjustDB = newModels[ch]->GetRecommendedOutputDBAdjustment();
+
+                Logger::writeToLog (String ("[NAM] calibration: hasCal=")
+                                    + (newHasCalibration ? "yes" : "no")
+                                    + ", modelInDBu=" + String (newModelInputLevelDBu, 2)
+                                    + ", recommendedOutDB=" + String (newCalOutputAdjustDB, 2));
+            }
         }
     }
     catch (const std::exception& exc)
@@ -147,6 +214,9 @@ void NAMProcessor::loadModelFromFile (const File& file, Component* parent)
             models[ch] = std::move (newModels[ch]);
         cachedModelPath = file.getFullPathName();
         currentModelName = file.getFileNameWithoutExtension();
+        modelHasCalibration = newHasCalibration;
+        modelInputLevelDBu = newModelInputLevelDBu;
+        calOutputAdjustDB = newCalOutputAdjustDB;
     }
 
     modelChangeBroadcaster();
@@ -188,6 +258,10 @@ void NAMProcessor::prepare (double sampleRate, int samplesPerBlock)
     inGain.setRampDurationSeconds (0.05);
     outGain.prepare (spec);
     outGain.setRampDurationSeconds (0.05);
+    calInGain.prepare (spec);
+    calInGain.setRampDurationSeconds (0.05);
+    calOutGain.prepare (spec);
+    calOutGain.setRampDurationSeconds (0.05);
 
     dcBlocker.prepare (spec);
     dcBlocker.calcCoefs (20.0f, (float) sampleRate);
@@ -200,29 +274,45 @@ void NAMProcessor::prepare (double sampleRate, int samplesPerBlock)
         try
         {
             std::array<std::unique_ptr<NeuralAudio::NeuralModel>, 2> newModels {};
-            for (auto& newModel : newModels)
+            bool newHasCalibration = false;
+            float newModelInputLevelDBu = 12.0f;
+            float newCalOutputAdjustDB = 0.0f;
+
+            for (size_t ch = 0; ch < newModels.size(); ++ch)
             {
                 NeuralAudio::NeuralModelLoader loader;
                 loader.SetExternalSampleRate ((int) processSampleRate);
                 loader.SetDefaultMaxAudioBufferSize (processMaxBlockSize);
+                loader.SetAudioInputLevelDBu (0.0f);
                 auto* raw = loader.CreateFromFile (pathCopy.toStdString());
                 if (raw == nullptr)
                     throw std::runtime_error ("CreateFromFile returned null");
-                newModel.reset (raw);
-                newModel->SetMaxAudioBufferSize (processMaxBlockSize);
-                newModel->SetQualityScaleFactor (qualityParam != nullptr
-                                                     ? qualityParam->getCurrentValue()
-                                                     : 1.0f);
+                newModels[ch].reset (raw);
+                newModels[ch]->SetMaxAudioBufferSize (processMaxBlockSize);
+                newModels[ch]->SetQualityScaleFactor (qualityParam != nullptr
+                                                          ? qualityParam->getCurrentValue()
+                                                          : 1.0f);
+
+                if (ch == 0)
+                {
+                    newHasCalibration = ! newModels[ch]->GetMetadata ("input_level_dbu").empty();
+                    newModelInputLevelDBu = -newModels[ch]->GetRecommendedInputDBAdjustment();
+                    newCalOutputAdjustDB = newModels[ch]->GetRecommendedOutputDBAdjustment();
+                }
             }
             SpinLock::ScopedLockType lock { modelChangingMutex };
             for (size_t ch = 0; ch < models.size(); ++ch)
                 models[ch] = std::move (newModels[ch]);
+            modelHasCalibration = newHasCalibration;
+            modelInputLevelDBu = newModelInputLevelDBu;
+            calOutputAdjustDB = newCalOutputAdjustDB;
         }
         catch (...)
         {
             SpinLock::ScopedLockType lock { modelChangingMutex };
             for (auto& m : models)
                 m.reset();
+            modelHasCalibration = false;
         }
     }
 }
@@ -236,9 +326,20 @@ void NAMProcessor::processAudio (AudioBuffer<float>& buffer)
     const auto numChannels = buffer.getNumChannels();
     const auto numSamples = buffer.getNumSamples();
 
-    // Input gain
+    // Calibration only kicks in if the toggle is on AND the model carries
+    // input_level_dbu metadata. Otherwise the two cal stages are unity.
+    const bool applyCalibration = modelHasCalibration && calibrateParam->get();
+    const float calInDB = applyCalibration
+                              ? (inputCalDBuParam->getCurrentValue() - modelInputLevelDBu)
+                              : 0.0f;
+    const float calOutDB = applyCalibration ? calOutputAdjustDB : 0.0f;
+
+    // Signal chain: user-in → cal-in → model → cal-out → user-out → DC block
     inGain.setGainDecibels (inputGainParam->getCurrentValue());
     inGain.process (buffer);
+
+    calInGain.setGainDecibels (calInDB);
+    calInGain.process (buffer);
 
     // Model processing (per channel)
     for (int ch = 0; ch < numChannels && ch < (int) models.size(); ++ch)
@@ -255,7 +356,9 @@ void NAMProcessor::processAudio (AudioBuffer<float>& buffer)
         models[(size_t) ch]->Process (x, x, (size_t) numSamples);
     }
 
-    // Output gain
+    calOutGain.setGainDecibels (calOutDB);
+    calOutGain.process (buffer);
+
     outGain.setGainDecibels (outputGainParam->getCurrentValue());
     outGain.process (buffer);
 
@@ -302,47 +405,96 @@ bool NAMProcessor::getCustomComponents (OwnedArray<Component>& customComps, chow
     // NOTE: BYOD's KnobsComponent only lays out custom components that are
     // Sliders or ComboBoxes (TextButtons in the customComponents array get
     // zero bounds). So we use a ComboBox here, mirroring GuitarMLAmp's
-    // ModelChoiceBox pattern.
+    // ModelChoiceBox pattern. The popup is built manually (bypassing
+    // ComboBox's automatic menu) so we can include a checkable, optionally-
+    // disabled "Calibrate Input" toggle.
     class ModelChoiceBox : public ComboBox
     {
     public:
         ModelChoiceBox (NAMProcessor& proc, ModelChangeBroadcaster& caster)
             : processor (proc)
         {
-            refreshItems();
             setText (getDisplayText(), dontSendNotification);
+            refreshTooltip();
 
             modelChangeCallback = caster.connect ([this]
                                                   {
                                                       Logger::writeToLog ("[NAM] UI: model-change broadcast received, refreshing ComboBox to: "
                                                                           + getDisplayText());
-                                                      refreshItems();
                                                       setText (getDisplayText(), dontSendNotification);
+                                                      refreshTooltip();
                                                       repaint();
                                                   });
-
-            onChange = [this]
-            {
-                const auto id = getSelectedId();
-                // Allow the same item to be picked again next time.
-                setSelectedId (0, dontSendNotification);
-                setText (getDisplayText(), dontSendNotification);
-
-                if (id == loadItemId)
-                    processor.chooseModel (getTopLevelComponent());
-                else if (id == clearItemId)
-                    processor.clearModel();
-            };
 
             Component::setName ("nam_model__box");
         }
 
-        void refreshItems()
+        // Override the default ComboBox popup so we can inject a checkable
+        // Calibrate item that can be dynamically disabled.
+        void showPopup() override
         {
-            clear (dontSendNotification);
-            addItem ("Load Model...", loadItemId);
+            juce::PopupMenu menu;
+            menu.setLookAndFeel (&getLookAndFeel());
+
+            menu.addItem (loadItemId, "Load Model...");
+
             if (processor.getCurrentModelName().isNotEmpty())
-                addItem ("Clear Model", clearItemId);
+                menu.addItem (clearItemId, "Clear Model");
+
+            menu.addSeparator();
+
+            const bool hasCal = processor.currentModelHasCalibration();
+            auto* calParam = processor.getCalibrateParam();
+
+            juce::PopupMenu::Item calItem;
+            calItem.itemID = calibrateItemId;
+            if (hasCal)
+            {
+                calItem.text = "Calibrate Input  (model: "
+                               + juce::String (processor.getModelInputLevelDBu(), 1) + " dBu)";
+                calItem.isEnabled = true;
+                calItem.isTicked = (calParam != nullptr && calParam->get());
+            }
+            else
+            {
+                calItem.text = "Calibrate Input  (model not calibrated)";
+                calItem.isEnabled = false;
+                calItem.isTicked = false;
+            }
+            menu.addItem (calItem);
+
+            menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this),
+                                [this] (int result)
+                                {
+                                    if (result == loadItemId)
+                                    {
+                                        processor.chooseModel (getTopLevelComponent());
+                                    }
+                                    else if (result == clearItemId)
+                                    {
+                                        processor.clearModel();
+                                    }
+                                    else if (result == calibrateItemId)
+                                    {
+                                        if (auto* p = processor.getCalibrateParam())
+                                        {
+                                            const bool newValue = ! p->get();
+                                            p->beginChangeGesture();
+                                            p->setValueNotifyingHost (newValue ? 1.0f : 0.0f);
+                                            p->endChangeGesture();
+                                            refreshTooltip();
+                                        }
+                                    }
+                                });
+        }
+
+        void refreshTooltip()
+        {
+            if (! processor.currentModelHasCalibration())
+                setTooltip ("Model not calibrated - Calibrate Input control unavailable");
+            else
+                setTooltip ("Model calibration: "
+                            + juce::String (processor.getModelInputLevelDBu(), 1) + " dBu");
         }
 
         String getDisplayText() const
@@ -361,6 +513,7 @@ bool NAMProcessor::getCustomComponents (OwnedArray<Component>& customComps, chow
         {
             loadItemId = 1,
             clearItemId = 2,
+            calibrateItemId = 3,
         };
 
         NAMProcessor& processor;
