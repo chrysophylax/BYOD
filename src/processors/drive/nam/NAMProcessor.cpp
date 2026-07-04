@@ -119,6 +119,7 @@ void NAMProcessor::clearModel()
         SpinLock::ScopedLockType lock { modelChangingMutex };
         for (auto& m : models)
             m.reset();
+        modelsMaxBlockSize = 0;
         cachedModelPath.clear();
         currentModelName.clear();
         modelHasCalibration = false;
@@ -183,6 +184,7 @@ void NAMProcessor::loadModelFromFile (const File& file, Component* parent)
         SpinLock::ScopedLockType lock { modelChangingMutex };
         for (size_t ch = 0; ch < models.size(); ++ch)
             models[ch] = std::move (loaded.models[ch]);
+        modelsMaxBlockSize = processMaxBlockSize;
         cachedModelPath = file.getFullPathName();
         currentModelName = file.getFileNameWithoutExtension();
         modelHasCalibration = loaded.hasCalibration;
@@ -251,6 +253,7 @@ void NAMProcessor::prepare (double sampleRate, int samplesPerBlock)
             SpinLock::ScopedLockType lock { modelChangingMutex };
             for (size_t ch = 0; ch < models.size(); ++ch)
                 models[ch] = std::move (loaded.models[ch]);
+            modelsMaxBlockSize = processMaxBlockSize;
             modelHasCalibration = loaded.hasCalibration;
             modelInputLevelDBu = loaded.modelInputLevelDBu;
             calOutputAdjustDB = loaded.calOutputAdjustDB;
@@ -258,6 +261,11 @@ void NAMProcessor::prepare (double sampleRate, int samplesPerBlock)
         }
         catch (...)
         {
+            // The stale models stay live (see comment above), but
+            // modelsMaxBlockSize deliberately keeps its old value:
+            // processAudio() bypasses the models for any block larger than
+            // they were built for, and processing resumes automatically
+            // once a reload succeeds.
             Logger::writeToLog ("NAM: prepare() model reload failed for " + cachedModelPath);
         }
     }
@@ -294,26 +302,36 @@ void NAMProcessor::processAudio (AudioBuffer<float>& buffer)
     const bool qualityChanged = newQuality != lastQualityApplied;
     bool qualityAppliedThisBlock = true;
 
-    for (int ch = 0; ch < numChannels && ch < (int) models.size(); ++ch)
+    // NeuralAudio models must never be given more samples than the max
+    // buffer size they were built with: exceeding it is unchecked in release
+    // builds, and per the NeuralAudio README, SetMaxAudioBufferSize() is not
+    // realtime-safe so we can't resize here. This can happen if a
+    // prepare()-time model reload failed while the block size grew (e.g. the
+    // model file was deleted and the oversampling factor was raised); in
+    // that case, bypass the models until a reload succeeds.
+    if (numSamples <= modelsMaxBlockSize)
     {
-        auto& model = models[(size_t) ch];
-        if (model == nullptr)
-            continue;
-
-        if (qualityChanged)
+        for (int ch = 0; ch < numChannels && ch < (int) models.size(); ++ch)
         {
-            if (model->IsQualityChangeRealtimeSafe (newQuality))
-                model->SetQualityScaleFactor (newQuality);
-            else
-                qualityAppliedThisBlock = false;
+            auto& model = models[(size_t) ch];
+            if (model == nullptr)
+                continue;
+
+            if (qualityChanged)
+            {
+                if (model->IsQualityChangeRealtimeSafe (newQuality))
+                    model->SetQualityScaleFactor (newQuality);
+                else
+                    qualityAppliedThisBlock = false;
+            }
+
+            auto* x = buffer.getWritePointer (ch);
+            model->Process (x, x, (size_t) numSamples);
         }
 
-        auto* x = buffer.getWritePointer (ch);
-        model->Process (x, x, (size_t) numSamples);
+        if (qualityChanged && qualityAppliedThisBlock)
+            lastQualityApplied = newQuality;
     }
-
-    if (qualityChanged && qualityAppliedThisBlock)
-        lastQualityApplied = newQuality;
 
     calOutGain.setGainDecibels (calOutDB);
     calOutGain.process (buffer);
@@ -350,6 +368,7 @@ void NAMProcessor::fromXML (XmlElement* xml, const chowdsp::Version& version, bo
             SpinLock::ScopedLockType lock { modelChangingMutex };
             for (size_t ch = 0; ch < models.size(); ++ch)
                 models[ch] = std::move (loaded.models[ch]);
+            modelsMaxBlockSize = processMaxBlockSize;
             cachedModelPath = savedPath;
             currentModelName = file.getFileNameWithoutExtension();
             modelHasCalibration = loaded.hasCalibration;
@@ -371,6 +390,7 @@ void NAMProcessor::fromXML (XmlElement* xml, const chowdsp::Version& version, bo
         SpinLock::ScopedLockType lock { modelChangingMutex };
         for (auto& m : models)
             m.reset();
+        modelsMaxBlockSize = 0;
         cachedModelPath = savedPath;
         currentModelName = "(missing) " + File (savedPath).getFileNameWithoutExtension();
         modelHasCalibration = false;

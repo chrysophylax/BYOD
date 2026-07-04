@@ -80,6 +80,15 @@ private:
     std::array<std::unique_ptr<NeuralAudio::NeuralModel>, 2> models {};
     SpinLock modelChangingMutex;
 
+    // Max block size the *live* models were built for (0 if no models).
+    // NeuralAudio models must never be given more samples per Process() call
+    // than the max buffer size they were created with: the library's only
+    // guard in release builds is an assert, and SetMaxAudioBufferSize() is
+    // not realtime-safe. This can diverge from processMaxBlockSize when a
+    // prepare()-time reload fails and the stale models are kept running.
+    // Guarded by modelChangingMutex, alongside the models themselves.
+    int modelsMaxBlockSize = 0;
+
     String cachedModelPath; // absolute path, empty if no model loaded
     String currentModelName;
 
