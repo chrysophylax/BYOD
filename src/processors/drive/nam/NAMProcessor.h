@@ -102,7 +102,6 @@ private:
     std::shared_ptr<FileChooser> modelChooser;
 
     chowdsp::Gain<float> inGain, outGain;
-    chowdsp::Gain<float> calInGain, calOutGain; // calibration-only stages
     chowdsp::FirstOrderHPF<float> dcBlocker;
 
     double processSampleRate = 48000.0;

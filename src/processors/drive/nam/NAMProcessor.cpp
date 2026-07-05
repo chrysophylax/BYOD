@@ -233,10 +233,6 @@ void NAMProcessor::prepare (double sampleRate, int samplesPerBlock)
     inGain.setRampDurationSeconds (0.05);
     outGain.prepare (spec);
     outGain.setRampDurationSeconds (0.05);
-    calInGain.prepare (spec);
-    calInGain.setRampDurationSeconds (0.05);
-    calOutGain.prepare (spec);
-    calOutGain.setRampDurationSeconds (0.05);
 
     dcBlocker.prepare (spec);
     dcBlocker.calcCoefs (20.0f, (float) sampleRate);
@@ -281,19 +277,16 @@ void NAMProcessor::processAudio (AudioBuffer<float>& buffer)
     const auto numSamples = buffer.getNumSamples();
 
     // Calibration only engages when the toggle is on AND the model carries
-    // input_level_dbu metadata. Otherwise the cal stages run at unity.
+    // input_level_dbu metadata. Otherwise the cal offsets are zero.
     const bool applyCalibration = modelHasCalibration && calibrateParam->get();
     const float calInDB = applyCalibration
                               ? (inputCalDBuParam->getCurrentValue() - modelInputLevelDBu)
                               : 0.0f;
     const float calOutDB = applyCalibration ? calOutputAdjustDB : 0.0f;
 
-    // Signal chain: user-in -> cal-in -> model -> cal-out -> user-out -> DC block
-    inGain.setGainDecibels (inputGainParam->getCurrentValue());
+    // Signal chain: (user-in + cal-in) -> model -> (cal-out + user-out) -> DC block
+    inGain.setGainDecibels (inputGainParam->getCurrentValue() + calInDB);
     inGain.process (buffer);
-
-    calInGain.setGainDecibels (calInDB);
-    calInGain.process (buffer);
 
     // Only push the quality parameter into the model when it has actually
     // changed AND the model reports the change is realtime-safe. Otherwise
@@ -333,10 +326,7 @@ void NAMProcessor::processAudio (AudioBuffer<float>& buffer)
             lastQualityApplied = newQuality;
     }
 
-    calOutGain.setGainDecibels (calOutDB);
-    calOutGain.process (buffer);
-
-    outGain.setGainDecibels (outputGainParam->getCurrentValue());
+    outGain.setGainDecibels (outputGainParam->getCurrentValue() + calOutDB);
     outGain.process (buffer);
 
     dcBlocker.processBlock (buffer);
