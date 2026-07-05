@@ -20,9 +20,7 @@
 #include "drive/junior_b/JuniorB.h"
 #include "drive/king_of_tone/KingOfToneDrive.h"
 #include "drive/mouse_drive/MouseDrive.h"
-#if ! JUCE_IOS
 #include "drive/nam/NAMProcessor.h"
-#endif
 #include "drive/muff_clipper/MuffClipper.h"
 #include "drive/mxr_distortion/MXRDistortion.h"
 #include "drive/tube_amp/TubeAmp.h"
