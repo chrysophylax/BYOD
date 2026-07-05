@@ -61,6 +61,7 @@ if(NOT IOS)
         LAYER_ARRAY_BUFFER_PADDING=24
         RTNEURAL_USE_EIGEN=1
         RTNEURAL_DEFAULT_ALIGNMENT=16
+        _USE_MATH_DEFINES
     )
     target_include_directories(NeuralAudio
         PUBLIC
